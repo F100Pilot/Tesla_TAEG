@@ -1,4 +1,37 @@
 {
-  "signature": null,
-  "note": "Estado inicial. Atualizado automaticamente a cada verificacao."
+  "signature": "b765e548312be3e244cff95c83532a9ca84720393dd6845c6658b691d4723390",
+  "last_checked": "2026-07-20T16:53:19+00:00",
+  "promotion_detected": false,
+  "taeg_values": [],
+  "tan_values": [],
+  "last_report": {
+    "checked_at": "2026-07-20T16:53:19+00:00",
+    "promotion_detected": false,
+    "taeg_values": [],
+    "tan_values": [],
+    "pages": [
+      {
+        "url": "https://www.tesla.com/pt_PT/model3",
+        "error": "não acessível",
+        "has_promo": false
+      },
+      {
+        "url": "https://www.tesla.com/pt_PT/model3/design",
+        "error": "não acessível",
+        "has_promo": false
+      },
+      {
+        "url": "https://www.tesla.com/pt_PT/inventory/new/m3",
+        "error": "não acessível",
+        "has_promo": false
+      }
+    ]
+  },
+  "history": [
+    {
+      "checked_at": "2026-07-20T16:53:19+00:00",
+      "promotion_detected": false,
+      "changed": true
+    }
+  ]
 }
