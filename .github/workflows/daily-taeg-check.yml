@@ -1,0 +1,54 @@
+name: Verificação diária TAEG Tesla Model 3
+
+on:
+  schedule:
+    # Todos os dias às 08:00 UTC (~09:00 Portugal continental no inverno, 09:00/10:00 no verão)
+    - cron: "0 8 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Enviar email mesmo sem mudanças"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: taeg-check
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run TAEG checker
+        env:
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          NOTIFY_EMAIL: ${{ secrets.NOTIFY_EMAIL }}
+        run: |
+          python check_tesla_taeg.py ${{ (github.event_name == 'workflow_dispatch' && inputs.force) && '--force' || '' }}
+
+      - name: Commit updated state
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add state.json
+          if git diff --cached --quiet; then
+            echo "Sem alterações no estado."
+          else
+            git commit -m "chore: atualizar estado da verificação TAEG [skip ci]"
+            git push
+          fi
