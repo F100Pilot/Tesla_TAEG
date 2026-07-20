@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """Verificador diário de promoções de TAEG / financiamento do Tesla Model 3 em Portugal.
 
-A Tesla bloqueia (HTTP 403) os pedidos vindos de IPs de datacenter, como os do
-GitHub Actions. Para contornar isso, este script pode encaminhar os pedidos por
-uma API de scraping com IPs residenciais (ScraperAPI) quando SCRAPERAPI_KEY está
-definida; caso contrário abre as páginas num browser headless local (Chromium via
-Playwright), ideal a partir de um IP residencial (ex.: um container no Proxmox).
+A Tesla bloqueia (HTTP 403) os pedidos vindos de IPs de datacenter e deteta
+browsers automatizados. A partir de um IP residencial (ex.: um container no
+Proxmox) usa um Chromium "stealth" (patchright) em modo visível dentro de um
+ecrã virtual (xvfb) para ler as páginas como um browser normal. Em alternativa,
+se SCRAPERAPI_KEY estiver definida, encaminha por uma API de scraping (cloud).
 
-Procura menções a financiamento a crédito (TAEG, TAN, 0%, campanha, sem juros,
-etc.) e envia um email quando é detetada uma promoção nova ou quando os detalhes
-mudam face à última verificação.
+Procura menções a financiamento a crédito (TAEG, TAN, campanha, sem juros, etc.)
+e envia um email quando é detetada uma promoção nova ou quando os detalhes mudam
+face à última verificação.
 
 Uso:
     python check_tesla_taeg.py            # verificação normal (email só se mudar)
@@ -21,6 +21,7 @@ Configuração por variáveis de ambiente (ver README.md):
     GMAIL_USER          -> conta Gmail que envia (ex: pflm.bet@gmail.com)
     GMAIL_APP_PASSWORD  -> App Password de 16 caracteres do Gmail
     NOTIFY_EMAIL        -> destinatário (por omissão = GMAIL_USER)
+    PROMO_TAEG_MAX      -> TAEG (%) abaixo do qual conta como promoção (por omissão 4)
 """
 
 from __future__ import annotations
@@ -64,19 +65,32 @@ HEADERS = {
 
 # Palavras/expressões que indiciam uma PROMOÇÃO de financiamento.
 PROMO_KEYWORDS = [
-    r"tan\s*(?:de\s*)?0\s*%",
-    r"0\s*%\s*(?:de\s*)?(?:tan|juros)",
+    r"dispon[ií]vel a[^.]{0,60}?taeg",   # banner: "Disponível a 0,99% TAN, 1,77% TAEG"
     r"sem\s*juros",
     r"campanha",
     r"promo(?:ção|ções|cional)",
     r"oferta\s*de\s*financiamento",
     r"condições\s*especiais",
     r"taxa\s*reduzida",
+    r"consulte\s*os\s*termos",
 ]
 
-RE_TAEG = re.compile(r"TAEG[^0-9%]{0,30}?([0-9]+(?:[.,][0-9]+)?)\s*%", re.IGNORECASE)
-RE_TAN = re.compile(r"\bTAN\b[^0-9%]{0,30}?([0-9]+(?:[.,][0-9]+)?)\s*%", re.IGNORECASE)
+# A Tesla PT escreve o valor ANTES da sigla ("1,77% TAEG", "0,99% TAN",
+# "4,63% T.A.N."), por isso procuramos os dois sentidos.
+_NUM = r"([0-9]+(?:[.,][0-9]+)?)"
+RE_TAEG_PATTERNS = [
+    re.compile(_NUM + r"\s*%\s*(?:de\s+)?TAEG", re.IGNORECASE),   # valor antes (Tesla PT)
+    re.compile(r"TAEG[^0-9%]{0,20}?" + _NUM + r"\s*%", re.IGNORECASE),  # valor depois
+]
+# Para o TAN só usamos "valor antes" — "valor depois" apanharia por engano o
+# TAEG que costuma vir logo a seguir (ex.: "0,99% TAN, 1,77% TAEG").
+RE_TAN_PATTERNS = [
+    re.compile(_NUM + r"\s*%\s*(?:de\s+)?T\.?A\.?N\.?(?![A-Za-z])", re.IGNORECASE),
+]
 RE_PROMO = re.compile("|".join(PROMO_KEYWORDS), re.IGNORECASE)
+
+# TAEG (em %) abaixo deste valor é considerado promoção. Configurável.
+PROMO_TAEG_MAX = float(os.environ.get("PROMO_TAEG_MAX", "4"))
 
 TIMEOUT = 90
 
@@ -85,41 +99,74 @@ TIMEOUT = 90
 # Scraping
 # --------------------------------------------------------------------------- #
 
-def render_with_playwright(url: str) -> str | None:
-    """Abre `url` num Chromium headless (Playwright) e devolve o HTML renderizado.
+def _looks_blocked(html: str) -> bool:
+    """Deteta a página de bloqueio da Akamai (Access Denied / conteúdo mínimo)."""
+    if not html or len(html) < 1500:
+        return True
+    low = html.lower()
+    return "access denied" in low or "reference #" in low or "was blocked" in low
 
-    Devolve None se o Playwright não estiver instalado ou a página falhar. Ideal
-    para correr a partir de um IP residencial (ex.: um container no Proxmox).
-    """
+
+def _import_browser():
+    """Devolve (sync_playwright, TimeoutError, nome). Prefere patchright (stealth)."""
+    try:
+        from patchright.sync_api import TimeoutError as PWTimeout
+        from patchright.sync_api import sync_playwright
+        return sync_playwright, PWTimeout, "patchright"
+    except ImportError:
+        pass
     try:
         from playwright.sync_api import TimeoutError as PWTimeout
         from playwright.sync_api import sync_playwright
+        return sync_playwright, PWTimeout, "playwright"
     except ImportError:
-        return None  # Playwright não instalado — o chamador tenta outra via.
+        return None, None, None
 
+
+def render_with_playwright(url: str) -> str | None:
+    """Abre `url` num Chromium "stealth" e devolve o HTML renderizado.
+
+    Para contornar a deteção anti-bot da Tesla (Akamai) usa, por esta ordem:
+      - patchright (fork do Playwright com evasões), se instalado;
+      - modo visível (headful) — corre dentro de um ecrã virtual (xvfb);
+      - contexto persistente (perfil próprio), como um browser normal.
+    Devolve None se não houver browser instalado ou a página falhar.
+    """
+    sync_playwright, PWTimeout, driver = _import_browser()
+    if sync_playwright is None:
+        return None
+
+    headless = os.environ.get("HEADLESS", "false").lower() == "true"
     nav_timeout = int(os.environ.get("NAV_TIMEOUT_MS", "60000"))
+    profile_dir = os.environ.get(
+        "CHROME_PROFILE_DIR", str(Path(__file__).with_name(".chrome-profile"))
+    )
+    print(f"  (browser: {driver}, headless={headless})")
+
     with sync_playwright() as pw:
-        try:
-            browser = pw.chromium.launch(
-                headless=True,
-                args=["--no-sandbox", "--disable-blink-features=AutomationControlled"],
-            )
-        except Exception as exc:  # noqa: BLE001
-            print(f"  [erro] Não foi possível iniciar o Chromium: {exc}", file=sys.stderr)
-            return None
-        context = browser.new_context(
-            user_agent=USER_AGENT,
+        launch_kwargs = dict(
+            user_data_dir=profile_dir,
+            headless=headless,
             locale="pt-PT",
             timezone_id="Europe/Lisbon",
             viewport={"width": 1366, "height": 900},
+            args=["--no-sandbox", "--disable-dev-shm-usage"],
         )
-        page = context.new_page()
+        channel = os.environ.get("CHROME_CHANNEL")
+        if channel:
+            launch_kwargs["channel"] = channel
+        try:
+            context = pw.chromium.launch_persistent_context(**launch_kwargs)
+        except Exception as exc:  # noqa: BLE001
+            print(f"  [erro] Não foi possível iniciar o Chromium: {exc}", file=sys.stderr)
+            return None
+
+        page = context.pages[0] if context.pages else context.new_page()
         try:
             resp = page.goto(url, wait_until="domcontentloaded", timeout=nav_timeout)
             status = resp.status if resp else "?"
-            print(f"  HTTP {status} — {url} (Chromium)")
+            print(f"  HTTP {status} — {url} ({driver})")
 
-            # Aceitar banner de cookies, se existir.
             for label in ("Aceitar todos", "Aceitar", "Accept all", "Accept"):
                 try:
                     btn = page.get_by_role("button", name=re.compile(label, re.IGNORECASE))
@@ -129,11 +176,24 @@ def render_with_playwright(url: str) -> str | None:
                 except Exception:  # noqa: BLE001
                     pass
 
-            # Dar tempo ao JavaScript para carregar preços/financiamento.
             try:
                 page.wait_for_load_state("networkidle", timeout=15000)
             except PWTimeout:
                 pass
+
+            html = page.content() or ""
+
+            # Se a Akamai devolveu página de bloqueio, esperar e recarregar 1x
+            # (por vezes liberta depois de o browser enviar dados de sensor).
+            if _looks_blocked(html):
+                print("  (página bloqueada — a aguardar e a recarregar)")
+                page.wait_for_timeout(5000)
+                try:
+                    page.reload(wait_until="domcontentloaded", timeout=nav_timeout)
+                    page.wait_for_load_state("networkidle", timeout=10000)
+                except Exception:  # noqa: BLE001
+                    pass
+                html = page.content() or ""
 
             # Tentar abrir os detalhes de financiamento/pagamentos, se houver.
             for label in ("Financiamento", "Financiar", "pagament", "Como são calculados"):
@@ -142,20 +202,20 @@ def render_with_playwright(url: str) -> str | None:
                     if el.count():
                         el.first.click(timeout=2500)
                         page.wait_for_timeout(1500)
+                        html = page.content() or html
                         break
                 except Exception:  # noqa: BLE001
                     pass
 
-            return page.content() or ""
+            return html
         except PWTimeout:
-            print(f"  [erro] Timeout ao carregar {url} (Chromium)", file=sys.stderr)
+            print(f"  [erro] Timeout ao carregar {url} ({driver})", file=sys.stderr)
             return None
         except Exception as exc:  # noqa: BLE001
             print(f"  [erro] Falha ao renderizar {url}: {exc}", file=sys.stderr)
             return None
         finally:
             context.close()
-            browser.close()
 
 
 def fetch(url: str) -> str | None:
@@ -163,19 +223,19 @@ def fetch(url: str) -> str | None:
 
     Ordem de preferência:
       1. ScraperAPI, se SCRAPERAPI_KEY estiver definida (uso na cloud, proxies pagos);
-      2. Browser headless local (Playwright), ideal a partir de um IP residencial;
+      2. Browser stealth local (patchright/Playwright), ideal a partir de IP residencial;
       3. Pedido HTTP direto (último recurso).
     Devolve None se nada resultar.
     """
     api_key = os.environ.get("SCRAPERAPI_KEY")
 
     if not api_key:
-        # A partir de um IP residencial (ex.: Proxmox em casa) a Tesla não bloqueia,
-        # mas a página é renderizada por JavaScript — usamos um browser headless.
+        # A partir de um IP residencial (ex.: Proxmox em casa) a Tesla não bloqueia
+        # o IP, mas deteta browsers automatizados — usamos um Chromium stealth.
         html = render_with_playwright(url)
         if html is not None:
             return html
-        # Sem Playwright disponível: tentar pedido direto (pode não ter os valores JS).
+        # Sem browser disponível: tentar pedido direto (pode não ter os valores JS).
         try:
             resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
             if resp.status_code == 200:
@@ -237,9 +297,16 @@ def analyse(url: str, html: str) -> dict:
     full = collapse_whitespace(html)      # apanha também JSON embebido em scripts
     text = visible_text(html)             # texto legível, para excertos
 
-    # Valores: procurar no HTML completo (cobre texto visível + JSON de config).
-    taeg_values = sorted({m.group(1).replace(",", ".") for m in RE_TAEG.finditer(full)})
-    tan_values = sorted({m.group(1).replace(",", ".") for m in RE_TAN.finditer(full)})
+    # Valores: procurar no texto visível (a Tesla mostra "1,77% TAEG" / "0,99% TAN").
+    def _collect(patterns: list) -> list:
+        vals = set()
+        for pat in patterns:
+            for m in pat.finditer(text):
+                vals.add(m.group(1).replace(",", "."))
+        return sorted(vals, key=lambda v: float(v))
+
+    taeg_values = _collect(RE_TAEG_PATTERNS)
+    tan_values = _collect(RE_TAN_PATTERNS)
 
     promo_hits = []
     for m in RE_PROMO.finditer(text):
@@ -250,7 +317,10 @@ def analyse(url: str, html: str) -> dict:
     mentions_financing = bool(
         re.search(r"financiamento|crédito|credito|TAEG|\bTAN\b", full, re.IGNORECASE)
     )
-    has_promo = bool(promo_hits) or "0" in tan_values or "0.0" in tan_values
+    # Promoção: banner/campanha detetado OU um TAEG anormalmente baixo.
+    min_taeg = min((float(v) for v in taeg_values), default=None)
+    low_taeg = min_taeg is not None and min_taeg < PROMO_TAEG_MAX
+    has_promo = bool(promo_hits) or low_taeg
 
     print(
         f"  → financiamento={mentions_financing} TAEG={taeg_values or '—'} "
@@ -279,8 +349,8 @@ def run_checks() -> dict:
         pages.append(analyse(url, html))
 
     any_promo = any(p.get("has_promo") for p in pages)
-    all_taeg = sorted({v for p in pages for v in p.get("taeg_values", [])})
-    all_tan = sorted({v for p in pages for v in p.get("tan_values", [])})
+    all_taeg = sorted({v for p in pages for v in p.get("taeg_values", [])}, key=lambda v: float(v))
+    all_tan = sorted({v for p in pages for v in p.get("tan_values", [])}, key=lambda v: float(v))
 
     return {
         "checked_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),

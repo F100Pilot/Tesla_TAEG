@@ -6,9 +6,9 @@
 #   bash install.sh
 #
 # O que faz:
-#   - instala Python, git e as dependências do Chromium;
+#   - instala Python, git, xvfb e as dependências do Chromium;
 #   - clona (ou atualiza) o repositório em /opt/tesla-taeg;
-#   - cria um virtualenv e instala requisitos + Chromium (Playwright);
+#   - cria um virtualenv e instala requisitos + Chromium stealth (patchright);
 #   - instala o serviço + timer do systemd (verificação diária às 20:00);
 #   - cria /etc/tesla-taeg.env a partir do exemplo (tens de o editar depois).
 #
@@ -25,7 +25,7 @@ timedatectl set-timezone "${TZ_REGION}" 2>/dev/null || ln -sf "/usr/share/zonein
 echo ">> A instalar pacotes de sistema..."
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install -y --no-install-recommends git python3 python3-venv python3-pip ca-certificates tzdata
+apt-get install -y --no-install-recommends git python3 python3-venv python3-pip ca-certificates tzdata xvfb
 
 echo ">> A obter o código para ${APP_DIR}..."
 if [ -d "${APP_DIR}/.git" ]; then
@@ -39,8 +39,8 @@ python3 -m venv "${APP_DIR}/.venv"
 "${APP_DIR}/.venv/bin/pip" install --upgrade pip -q
 "${APP_DIR}/.venv/bin/pip" install -q -r "${APP_DIR}/requirements.txt"
 
-echo ">> A instalar o Chromium do Playwright (+ dependências do sistema)..."
-"${APP_DIR}/.venv/bin/python" -m playwright install --with-deps chromium
+echo ">> A instalar o Chromium stealth (patchright) + dependências do sistema..."
+"${APP_DIR}/.venv/bin/python" -m patchright install --with-deps chromium
 
 echo ">> A instalar o serviço e o timer do systemd..."
 install -m 644 "${APP_DIR}/deploy/tesla-taeg.service" /etc/systemd/system/tesla-taeg.service

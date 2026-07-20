@@ -1,2 +1,3 @@
 requests>=2.31,<3
-playwright>=1.44,<2
+# patchright: fork "stealth" do Playwright, para evitar a deteção anti-bot (Akamai).
+patchright>=1.44
