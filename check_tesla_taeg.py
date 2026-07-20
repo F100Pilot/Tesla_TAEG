@@ -89,34 +89,46 @@ TIMEOUT = 90
 def fetch(url: str) -> str | None:
     """Descarrega o HTML de `url`, via API de scraping se houver SCRAPERAPI_KEY.
 
-    Devolve None em caso de falha.
+    Com ScraperAPI, tenta configurações da mais barata para a mais forte e para
+    na primeira que devolver HTTP 200. Devolve None se nenhuma resultar.
     """
     api_key = os.environ.get("SCRAPERAPI_KEY")
 
-    try:
-        if api_key:
-            # Rota via ScraperAPI: IP residencial + renderização de JavaScript.
-            params = {
-                "api_key": api_key,
-                "url": url,
-                "render": "true",
-                "country_code": os.environ.get("SCRAPER_COUNTRY", "pt"),
-            }
-            # ultra_premium contorna anti-bots fortes (Akamai). Desligável para poupar créditos.
-            if os.environ.get("SCRAPER_ULTRA", "true").lower() == "true":
-                params["ultra_premium"] = "true"
+    if not api_key:
+        try:
+            resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
+            if resp.status_code == 200:
+                return resp.text
+            print(f"  [aviso] {url} devolveu HTTP {resp.status_code} (direto)", file=sys.stderr)
+        except requests.RequestException as exc:  # noqa: BLE001
+            print(f"  [erro] Falha ao descarregar {url}: {exc}", file=sys.stderr)
+        return None
+
+    country = os.environ.get("SCRAPER_COUNTRY", "pt")
+    # Escada de tentativas (a Tesla usa Akamai; pode exigir IPs residenciais).
+    attempts = [
+        {"render": "true", "country_code": country},
+        {"render": "true", "country_code": country, "premium": "true"},
+        {"render": "true", "country_code": country, "ultra_premium": "true"},
+    ]
+    for extra in attempts:
+        label = "+".join(k for k in ("premium", "ultra_premium") if k in extra) or "base"
+        params = {"api_key": api_key, "url": url, **extra}
+        try:
             resp = requests.get(
                 "https://api.scraperapi.com/", params=params, timeout=TIMEOUT
             )
-        else:
-            resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
-
+        except requests.RequestException as exc:  # noqa: BLE001
+            print(f"  [erro] ScraperAPI ({label}) falhou em {url}: {exc}", file=sys.stderr)
+            continue
         if resp.status_code == 200:
+            print(f"  ScraperAPI OK ({label}) — {url}")
             return resp.text
-        via = "ScraperAPI" if api_key else "direto"
-        print(f"  [aviso] {url} devolveu HTTP {resp.status_code} ({via})", file=sys.stderr)
-    except requests.RequestException as exc:  # noqa: BLE001
-        print(f"  [erro] Falha ao descarregar {url}: {exc}", file=sys.stderr)
+        body = collapse_whitespace(resp.text)[:200]
+        print(
+            f"  [aviso] ScraperAPI ({label}) devolveu HTTP {resp.status_code} em {url}: {body}",
+            file=sys.stderr,
+        )
     return None
 
 
