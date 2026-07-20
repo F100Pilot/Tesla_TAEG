@@ -167,11 +167,13 @@ def render_with_playwright(url: str) -> str | None:
             status = resp.status if resp else "?"
             print(f"  HTTP {status} — {url} ({driver})")
 
-            for label in ("Aceitar todos", "Aceitar", "Accept all", "Accept"):
+            for label in ("Aceitar todos", "Aceitar", "Aceitar tudo", "Accept all",
+                          "Accept", "Concordo", "Permitir todos"):
                 try:
                     btn = page.get_by_role("button", name=re.compile(label, re.IGNORECASE))
                     if btn.count():
                         btn.first.click(timeout=3000)
+                        page.wait_for_timeout(800)
                         break
                 except Exception:  # noqa: BLE001
                     pass
@@ -181,16 +183,29 @@ def render_with_playwright(url: str) -> str | None:
             except PWTimeout:
                 pass
 
+            # Esperar que a app (SPA) renderize preços/financiamento — o HTML
+            # inicial é só o "esqueleto"; os valores aparecem depois do JavaScript.
+            try:
+                page.wait_for_function(
+                    "() => { const t = document.body ? document.body.innerText : '';"
+                    " return t.length > 4000 || /TAEG|\\/\\s*m[\\u00eae]s|Encomendar/i.test(t); }",
+                    timeout=25000,
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            page.wait_for_timeout(2500)
+
             html = page.content() or ""
 
-            # Se a Akamai devolveu página de bloqueio, esperar e recarregar 1x
-            # (por vezes liberta depois de o browser enviar dados de sensor).
-            if _looks_blocked(html):
-                print("  (página bloqueada — a aguardar e a recarregar)")
+            # Se a Akamai devolveu página de bloqueio (ou o conteúdo ainda é o
+            # esqueleto), esperar e recarregar 1x.
+            if _looks_blocked(html) or "taeg" not in html.lower():
+                print(f"  (conteúdo incompleto: {len(html)} chars — a aguardar e recarregar)")
                 page.wait_for_timeout(5000)
                 try:
                     page.reload(wait_until="domcontentloaded", timeout=nav_timeout)
-                    page.wait_for_load_state("networkidle", timeout=10000)
+                    page.wait_for_load_state("networkidle", timeout=12000)
+                    page.wait_for_timeout(3500)
                 except Exception:  # noqa: BLE001
                     pass
                 html = page.content() or ""
