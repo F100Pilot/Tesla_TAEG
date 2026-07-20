@@ -131,12 +131,55 @@ python check_tesla_taeg.py --dry-run  # não envia email; só mostra o resultado
 
 ## Personalização
 
-Abre [`check_tesla_taeg.py`](check_tesla_taeg.py):
+### Mudar a versão do veículo seguida
 
-- **`URLS`** — páginas verificadas. Podes adicionar/remover URLs da Tesla PT.
-- **`PROMO_KEYWORDS`** — expressões que sinalizam uma campanha.
+O verificador seleciona uma versão no configurador e lê o TAEG e as condições
+dessa versão (por omissão: **Premium Long Range, tração traseira**). Para mudar,
+edita o ficheiro de configuração no container:
+
+```bash
+nano /etc/tesla-taeg.env
+```
+
+e acrescenta (ou altera) estas duas linhas, conforme a versão que queres:
+
+| Versão | Linhas a pôr no `/etc/tesla-taeg.env` |
+|--------|----------------------------------------|
+| Tração traseira (base) | `VERSION_LABEL=Tração traseira`<br>`VERSION_NAME=Model 3 Tração traseira` |
+| Premium Long Range, tração traseira *(por omissão)* | `VERSION_LABEL=Long Range,? tração traseira`<br>`VERSION_NAME=Premium Long Range, tração traseira` |
+| Premium Long Range, tração integral | `VERSION_LABEL=Long Range,? tração integral`<br>`VERSION_NAME=Premium Long Range, tração integral` |
+| Performance | `VERSION_LABEL=Performance`<br>`VERSION_NAME=Model 3 Performance` |
+
+- **`VERSION_LABEL`** é o texto do cartão da versão no configurador da Tesla
+  (aceita expressão regular; tem de corresponder ao texto mostrado na página).
+- **`VERSION_NAME`** é só o nome legível que aparece no email.
+
+Depois de editar, testa já com:
+
+```bash
+systemctl start tesla-taeg.service
+journalctl -u tesla-taeg.service -n 40 --no-pager
+```
+
+No output deve aparecer `(versão selecionada: <o teu VERSION_NAME>)` e o email
+passa a mostrar o TAEG dessa versão. Se aparecer `cartão da versão não
+encontrado`, o `VERSION_LABEL` não corresponde ao texto da página — confirma o
+nome exato do cartão no [configurador](https://www.tesla.com/pt_PT/model3/design).
+
+> Nota: se a Tesla mudar os nomes das versões, é preciso ajustar o
+> `VERSION_LABEL` em conformidade.
+
+### Outros ajustes
+
+Abre [`check_tesla_taeg.py`](check_tesla_taeg.py) ou define variáveis no
+`/etc/tesla-taeg.env`:
+
+- **`TESLA_URL`** (env) — página verificada (por omissão, o configurador do Model 3).
+- **`PROMO_TAEG_MAX`** (env) — TAEG (%) abaixo do qual conta como promoção (por omissão `4`).
+- **`PROMO_KEYWORDS`** (no script) — expressões que sinalizam uma campanha.
 - Hora da verificação: `OnCalendar` em `deploy/tesla-taeg.timer`
-  (ou, no container, `/etc/systemd/system/tesla-taeg.timer`).
+  (ou, no container, `/etc/systemd/system/tesla-taeg.timer`, seguido de
+  `systemctl daemon-reload`).
 
 ---
 
