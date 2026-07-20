@@ -5,21 +5,23 @@ existe alguma **promoção de financiamento a crédito** (TAEG / TAN 0% / campan
 sem juros) para a compra de um **Model 3**. Quando deteta uma promoção nova — ou
 uma mudança nas condições — envia-te um **email**.
 
-Corre automaticamente no **GitHub Actions** (não precisas de deixar nenhum
-computador ligado).
+Corre num **container LXC no Proxmox** (ou noutra máquina em casa), agendado uma
+vez por dia.
 
 ---
 
-> ℹ️ **Importante:** a Tesla bloqueia (HTTP 403) os pedidos vindos de servidores/datacenters,
-> como os do GitHub Actions. Por isso o verificador usa uma **API de scraping**
-> (ScraperAPI, com plano gratuito) que faz o pedido a partir de um IP residencial
-> e executa o JavaScript da página. Sem essa chave, o verificador só funciona se
-> for corrido a partir de um IP residencial (o teu computador).
+> ℹ️ **Porque não corre no GitHub/cloud?** A Tesla bloqueia (HTTP 403) os pedidos
+> vindos de IPs de datacenter (GitHub Actions, VPS, Cloudflare, etc.). Só passam
+> IPs **residenciais**. Por isso a forma gratuita e fiável é correr a partir de
+> casa (o teu Proxmox), onde o IP é residencial. A partir de casa, a página é
+> aberta num **browser headless (Chromium)** para executar o JavaScript e ler os
+> valores. *(Alternativa: manter no GitHub Actions com um plano **pago** de
+> proxies residenciais — ver o fim deste ficheiro.)*
 
 ## Como funciona
 
-1. Uma vez por dia, o GitHub Actions corre o script [`check_tesla_taeg.py`](check_tesla_taeg.py).
-2. O script descarrega as páginas públicas do Model 3 na Tesla Portugal (via ScraperAPI) e procura:
+1. Uma vez por dia, um *timer* do systemd corre o script [`check_tesla_taeg.py`](check_tesla_taeg.py).
+2. O script abre as páginas do Model 3 (Tesla PT) num Chromium headless e procura:
    - valores de **TAEG** e **TAN**;
    - palavras de campanha: *"TAN 0%"*, *"sem juros"*, *"campanha"*, *"promoção"*,
      *"condições especiais"*, *"taxa reduzida"*, etc.
@@ -32,67 +34,98 @@ computador ligado).
 
 ---
 
-## Configuração (uma vez)
+## Instalação no Proxmox (container LXC)
 
-O email é enviado através do Gmail. Precisas de criar uma **App Password** e
-guardar 2 secrets no repositório.
+### 1. Criar o container (na consola do host Proxmox)
 
-### 1. Criar uma App Password do Gmail
+Cria um container **Debian 12**. Pela interface web do Proxmox (*Create CT*) ou
+pela linha de comandos do host (ajusta o `--storage`, `--bridge` e a password):
+
+```bash
+# Descarregar o template Debian 12, se ainda não o tiveres
+pveam update && pveam download local debian-12-standard_12.7-1_amd64.tar.zst
+
+# Criar o container (ID 200 como exemplo). DHCP na tua rede = IP residencial.
+pct create 200 local:vztmpl/debian-12-standard_12.7-1_amd64.tar.zst \
+  --hostname tesla-taeg \
+  --cores 2 --memory 1024 --swap 512 \
+  --rootfs local-lvm:8 \
+  --net0 name=eth0,bridge=vmbr0,ip=dhcp \
+  --features nesting=1 \
+  --unprivileged 1 \
+  --password
+
+pct start 200
+pct enter 200      # entra no container como root
+```
+
+> O `--features nesting=1` ajuda o Chromium a arrancar dentro do LXC.
+
+### 2. Instalar a aplicação (dentro do container)
+
+```bash
+apt-get update && apt-get install -y curl
+curl -fsSL https://raw.githubusercontent.com/F100Pilot/Tesla_TAEG/main/deploy/install.sh -o install.sh
+bash install.sh
+```
+
+O script instala tudo (Python, Chromium, dependências), agenda a verificação
+**diária às 20:00** e cria o ficheiro de credenciais.
+
+### 3. Pôr as credenciais do Gmail
+
+```bash
+nano /etc/tesla-taeg.env      # define GMAIL_USER e GMAIL_APP_PASSWORD
+```
+
+(Como obter a App Password: ver a secção do Gmail mais abaixo.)
+
+### 4. Testar
+
+```bash
+systemctl start tesla-taeg.service           # corre já uma verificação
+journalctl -u tesla-taeg.service -n 60 --no-pager   # ver o resultado
+systemctl list-timers tesla-taeg.timer       # ver quando corre a seguir
+```
+
+Para **mudar a hora**, edita `OnCalendar` em
+`/etc/systemd/system/tesla-taeg.timer` e corre `systemctl daemon-reload`.
+
+Para **atualizar** o código mais tarde: volta a correr `bash install.sh` (faz
+`git pull` e reinstala).
+
+---
+
+## Credenciais do Gmail
+
+O email é enviado através do Gmail. Precisas de uma **App Password**.
 
 1. A conta Gmail precisa de ter a **verificação em 2 passos** ativada:
    <https://myaccount.google.com/security>
 2. Vai a <https://myaccount.google.com/apppasswords>
 3. Cria uma password de app (ex.: nome "Tesla TAEG"). Vais receber um código de
-   **16 letras** (ex.: `abcd efgh ijkl mnop`). Copia-o **sem espaços**.
-
-### 2. Criar uma chave da API de scraping (ScraperAPI — grátis)
-
-1. Vai a <https://www.scraperapi.com/> e cria uma conta gratuita.
-2. No painel (dashboard) copia a tua **API Key**.
-3. O plano gratuito dá 1.000 créditos/mês — mais do que suficiente para uma
-   verificação por dia.
-
-> Alternativas equivalentes: [ZenRows](https://www.zenrows.com/),
-> [ScrapingBee](https://www.scrapingbee.com/). Se preferires outra, adapta a
-> função `fetch()` em [`check_tesla_taeg.py`](check_tesla_taeg.py).
-
-### 3. Adicionar os secrets no GitHub
-
-No repositório: **Settings → Secrets and variables → Actions → New repository secret**
-
-| Nome do secret       | Valor                                             |
-|----------------------|---------------------------------------------------|
-| `SCRAPERAPI_KEY`     | A API Key do ScraperAPI                           |
-| `GMAIL_USER`         | O teu Gmail (ex.: `pflm.bet@gmail.com`)           |
-| `GMAIL_APP_PASSWORD` | A App Password de 16 letras (sem espaços)         |
-| `NOTIFY_EMAIL`       | *(opcional)* destinatário; por omissão = `GMAIL_USER` |
-
-### 4. Ativar os GitHub Actions
-
-Vai ao separador **Actions** do repositório e, se pedido, confirma que queres
-ativar os workflows. Está agendado para correr **todos os dias às 08:00 UTC**.
+   **16 letras** (ex.: `abcd efgh ijkl mnop`).
+4. Cola essa password em `/etc/tesla-taeg.env` (variável `GMAIL_APP_PASSWORD`),
+   **sem espaços**.
 
 ---
 
-## Testar / correr manualmente
+## Correr à mão / testar (em qualquer máquina)
 
-- **No GitHub:** separador **Actions → "Verificação diária TAEG Tesla Model 3"
-  → Run workflow**. Podes marcar a opção *"Enviar email mesmo sem mudanças"*
-  para forçar um email de teste.
+```bash
+pip install -r requirements.txt
+python -m playwright install --with-deps chromium
 
-- **No teu computador:**
-  ```bash
-  pip install -r requirements.txt
+export GMAIL_USER="pflm.bet@gmail.com"
+export GMAIL_APP_PASSWORD="abcdefghijklmnop"   # App Password sem espaços
 
-  # Configura as variáveis de ambiente
-  export SCRAPERAPI_KEY="a_tua_api_key"          # opcional se correres de casa
-  export GMAIL_USER="pflm.bet@gmail.com"
-  export GMAIL_APP_PASSWORD="abcdefghijklmnop"   # App Password sem espaços
+python check_tesla_taeg.py            # verificação normal (email só se mudar)
+python check_tesla_taeg.py --force    # envia email com o estado atual
+python check_tesla_taeg.py --dry-run  # não envia email; só mostra o resultado
+```
 
-  python check_tesla_taeg.py            # verificação normal
-  python check_tesla_taeg.py --force    # envia email com o estado atual
-  python check_tesla_taeg.py --dry-run  # não envia email; só mostra o resultado
-  ```
+> Tem de ser a partir de um **IP residencial** (casa). De um IP de datacenter a
+> Tesla devolve 403.
 
 ---
 
@@ -102,9 +135,8 @@ Abre [`check_tesla_taeg.py`](check_tesla_taeg.py):
 
 - **`URLS`** — páginas verificadas. Podes adicionar/remover URLs da Tesla PT.
 - **`PROMO_KEYWORDS`** — expressões que sinalizam uma campanha.
-- Horário: edita o `cron` em
-  [`.github/workflows/daily-taeg-check.yml`](.github/workflows/daily-taeg-check.yml)
-  (está em UTC).
+- Hora da verificação: `OnCalendar` em `deploy/tesla-taeg.timer`
+  (ou, no container, `/etc/systemd/system/tesla-taeg.timer`).
 
 ---
 
@@ -112,18 +144,42 @@ Abre [`check_tesla_taeg.py`](check_tesla_taeg.py):
 
 | Ficheiro | Descrição |
 |----------|-----------|
-| `check_tesla_taeg.py` | Script principal (scraping + deteção + email). |
-| `.github/workflows/daily-taeg-check.yml` | Agendamento diário no GitHub Actions. |
+| `check_tesla_taeg.py` | Script principal (browser headless + deteção + email). |
+| `deploy/install.sh` | Instalador para o container LXC (Proxmox). |
+| `deploy/tesla-taeg.service` / `.timer` | Serviço + agendamento diário (systemd). |
+| `deploy/tesla-taeg.env.example` | Modelo do ficheiro de credenciais. |
 | `requirements.txt` | Dependências Python. |
 | `state.json` | Estado da última verificação (criado/atualizado automaticamente). |
+| `.github/workflows/daily-taeg-check.yml` | Execução manual na cloud (opcional; requer proxy pago). |
+
+---
+
+## Opcional — correr na cloud (GitHub Actions) com proxy pago
+
+Se preferires não depender de uma máquina em casa, podes correr no GitHub Actions
+usando um serviço de scraping com **proxies residenciais pagos** (o plano
+gratuito **não** chega — a Tesla exige IPs residenciais):
+
+1. Subscreve um plano pago em [ScraperAPI](https://www.scraperapi.com/) (ou
+   [ZenRows](https://www.zenrows.com/) / [ScrapingBee](https://www.scrapingbee.com/)).
+2. Em **Settings → Secrets and variables → Actions**, adiciona os secrets
+   `SCRAPERAPI_KEY`, `GMAIL_USER`, `GMAIL_APP_PASSWORD` (e `NOTIFY_EMAIL`, opcional).
+3. Reativa o agendamento em
+   [`.github/workflows/daily-taeg-check.yml`](.github/workflows/daily-taeg-check.yml)
+   (adiciona de volta o bloco `schedule:`), ou corre manualmente em **Actions →
+   Run workflow**.
+
+Quando `SCRAPERAPI_KEY` está definida, o script usa a API (com proxies
+residenciais). Sem ela, usa o browser headless local.
 
 ---
 
 ## Notas técnicas
 
-- O site da Tesla renderiza muito conteúdo por JavaScript. O script procura os
-  termos tanto no texto visível como no JSON embebido nas páginas, o que cobre a
-  maioria dos casos. Se a Tesla mudar a estrutura das páginas e deixares de
-  receber alertas, pode ser necessário atualizar as `URLS` ou os
+- A Tesla renderiza o conteúdo por JavaScript, por isso usamos um Chromium
+  headless (Playwright). O script procura os termos no HTML renderizado (texto
+  visível + JSON embebido). Se a Tesla mudar a estrutura das páginas e deixares
+  de receber alertas, pode ser necessário atualizar as `URLS` ou os
   `PROMO_KEYWORDS`.
-- Nenhuma credencial fica no código — só nos *secrets* do GitHub.
+- Nenhuma credencial fica no código — ficam em `/etc/tesla-taeg.env` (fora do git)
+  ou nos *secrets* do GitHub.

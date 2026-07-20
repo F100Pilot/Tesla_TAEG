@@ -2,10 +2,10 @@
 """Verificador diário de promoções de TAEG / financiamento do Tesla Model 3 em Portugal.
 
 A Tesla bloqueia (HTTP 403) os pedidos vindos de IPs de datacenter, como os do
-GitHub Actions. Para contornar isso, este script encaminha os pedidos por uma
-API de scraping com IPs residenciais e renderização de JavaScript (por omissão,
-ScraperAPI) quando a variável de ambiente SCRAPERAPI_KEY está definida. Sem essa
-chave, faz um pedido direto (útil quando corre a partir de um IP residencial).
+GitHub Actions. Para contornar isso, este script pode encaminhar os pedidos por
+uma API de scraping com IPs residenciais (ScraperAPI) quando SCRAPERAPI_KEY está
+definida; caso contrário abre as páginas num browser headless local (Chromium via
+Playwright), ideal a partir de um IP residencial (ex.: um container no Proxmox).
 
 Procura menções a financiamento a crédito (TAEG, TAN, 0%, campanha, sem juros,
 etc.) e envia um email quando é detetada uma promoção nova ou quando os detalhes
@@ -17,7 +17,7 @@ Uso:
     python check_tesla_taeg.py --dry-run  # não envia email, apenas imprime o resultado
 
 Configuração por variáveis de ambiente (ver README.md):
-    SCRAPERAPI_KEY      -> chave da API de scraping (recomendado no GitHub Actions)
+    SCRAPERAPI_KEY      -> chave da API de scraping (opcional; para uso na cloud)
     GMAIL_USER          -> conta Gmail que envia (ex: pflm.bet@gmail.com)
     GMAIL_APP_PASSWORD  -> App Password de 16 caracteres do Gmail
     NOTIFY_EMAIL        -> destinatário (por omissão = GMAIL_USER)
@@ -44,7 +44,6 @@ import requests
 # --------------------------------------------------------------------------- #
 
 # Páginas da Tesla Portugal onde costumam aparecer condições de financiamento.
-# Cada pedido à API de scraping consome créditos, por isso mantemos a lista curta.
 URLS = [
     "https://www.tesla.com/pt_PT/model3/design",
     "https://www.tesla.com/pt_PT/model3",
@@ -86,15 +85,97 @@ TIMEOUT = 90
 # Scraping
 # --------------------------------------------------------------------------- #
 
-def fetch(url: str) -> str | None:
-    """Descarrega o HTML de `url`, via API de scraping se houver SCRAPERAPI_KEY.
+def render_with_playwright(url: str) -> str | None:
+    """Abre `url` num Chromium headless (Playwright) e devolve o HTML renderizado.
 
-    Com ScraperAPI, tenta configurações da mais barata para a mais forte e para
-    na primeira que devolver HTTP 200. Devolve None se nenhuma resultar.
+    Devolve None se o Playwright não estiver instalado ou a página falhar. Ideal
+    para correr a partir de um IP residencial (ex.: um container no Proxmox).
+    """
+    try:
+        from playwright.sync_api import TimeoutError as PWTimeout
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return None  # Playwright não instalado — o chamador tenta outra via.
+
+    nav_timeout = int(os.environ.get("NAV_TIMEOUT_MS", "60000"))
+    with sync_playwright() as pw:
+        try:
+            browser = pw.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-blink-features=AutomationControlled"],
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"  [erro] Não foi possível iniciar o Chromium: {exc}", file=sys.stderr)
+            return None
+        context = browser.new_context(
+            user_agent=USER_AGENT,
+            locale="pt-PT",
+            timezone_id="Europe/Lisbon",
+            viewport={"width": 1366, "height": 900},
+        )
+        page = context.new_page()
+        try:
+            resp = page.goto(url, wait_until="domcontentloaded", timeout=nav_timeout)
+            status = resp.status if resp else "?"
+            print(f"  HTTP {status} — {url} (Chromium)")
+
+            # Aceitar banner de cookies, se existir.
+            for label in ("Aceitar todos", "Aceitar", "Accept all", "Accept"):
+                try:
+                    btn = page.get_by_role("button", name=re.compile(label, re.IGNORECASE))
+                    if btn.count():
+                        btn.first.click(timeout=3000)
+                        break
+                except Exception:  # noqa: BLE001
+                    pass
+
+            # Dar tempo ao JavaScript para carregar preços/financiamento.
+            try:
+                page.wait_for_load_state("networkidle", timeout=15000)
+            except PWTimeout:
+                pass
+
+            # Tentar abrir os detalhes de financiamento/pagamentos, se houver.
+            for label in ("Financiamento", "Financiar", "pagament", "Como são calculados"):
+                try:
+                    el = page.get_by_text(re.compile(label, re.IGNORECASE))
+                    if el.count():
+                        el.first.click(timeout=2500)
+                        page.wait_for_timeout(1500)
+                        break
+                except Exception:  # noqa: BLE001
+                    pass
+
+            return page.content() or ""
+        except PWTimeout:
+            print(f"  [erro] Timeout ao carregar {url} (Chromium)", file=sys.stderr)
+            return None
+        except Exception as exc:  # noqa: BLE001
+            print(f"  [erro] Falha ao renderizar {url}: {exc}", file=sys.stderr)
+            return None
+        finally:
+            context.close()
+            browser.close()
+
+
+def fetch(url: str) -> str | None:
+    """Obtém o HTML renderizado de `url`.
+
+    Ordem de preferência:
+      1. ScraperAPI, se SCRAPERAPI_KEY estiver definida (uso na cloud, proxies pagos);
+      2. Browser headless local (Playwright), ideal a partir de um IP residencial;
+      3. Pedido HTTP direto (último recurso).
+    Devolve None se nada resultar.
     """
     api_key = os.environ.get("SCRAPERAPI_KEY")
 
     if not api_key:
+        # A partir de um IP residencial (ex.: Proxmox em casa) a Tesla não bloqueia,
+        # mas a página é renderizada por JavaScript — usamos um browser headless.
+        html = render_with_playwright(url)
+        if html is not None:
+            return html
+        # Sem Playwright disponível: tentar pedido direto (pode não ter os valores JS).
         try:
             resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
             if resp.status_code == 200:
@@ -280,7 +361,7 @@ def build_email_body(report: dict) -> str:
     lines.append("Confirma sempre as condições diretamente no site oficial da Tesla:")
     lines.append("https://www.tesla.com/pt_PT/model3")
     lines.append("")
-    lines.append("— Verificador automático de TAEG (GitHub Actions)")
+    lines.append("— Verificador automático de TAEG")
     return "\n".join(lines)
 
 
@@ -322,13 +403,6 @@ def main() -> int:
     parser.add_argument("--force", action="store_true", help="Enviar email mesmo sem mudanças.")
     parser.add_argument("--dry-run", action="store_true", help="Não enviar email; só imprimir.")
     args = parser.parse_args()
-
-    if not os.environ.get("SCRAPERAPI_KEY"):
-        print(
-            "[aviso] SCRAPERAPI_KEY não definida — pedido direto (a Tesla bloqueia "
-            "IPs de datacenter, por isso no GitHub Actions isto costuma dar 403).",
-            file=sys.stderr,
-        )
 
     report = run_checks()
     sig = signature(report)
