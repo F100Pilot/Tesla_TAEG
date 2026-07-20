@@ -7,3 +7,8 @@ venv/
 
 # Credenciais locais (deploy)
 tesla-taeg.env
+
+# Artefactos de execução / diagnóstico
+last_page_text.txt
+debug_*.html
+.chrome-profile/
