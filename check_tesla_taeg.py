@@ -93,6 +93,19 @@ RE_PROMO = re.compile("|".join(PROMO_KEYWORDS), re.IGNORECASE)
 # TAEG (em %) abaixo deste valor é considerado promoção. Configurável.
 PROMO_TAEG_MAX = float(os.environ.get("PROMO_TAEG_MAX", "4"))
 
+# Versão específica a seguir: o texto do cartão a clicar no configurador e o
+# nome legível para o email. Configurável via VERSION_LABEL / VERSION_NAME.
+VERSION_LABEL = os.environ.get("VERSION_LABEL", r"Long Range,?\s*tra[cç][aã]o\s*traseira")
+VERSION_NAME = os.environ.get("VERSION_NAME", "Premium Long Range, tração traseira")
+
+# Linha de detalhe do financiamento da versão selecionada, ex.:
+# "*9700 € de entrada inicial, 84 meses, 4,63% T.A.N., 5,66% TAEG, Preço de compra: 45 975 €"
+RE_DETAIL = re.compile(
+    r"\d[\d\s.,]*\s*€\s*de\s*entrada\s*inicial.{0,160}?TAEG.{0,90}?"
+    r"Pre[cç]o\s*de\s*(?:compra|aquisi[cç][aã]o)\s*:?\s*\d[\d\s.,]*\s*€",
+    re.IGNORECASE,
+)
+
 TIMEOUT = 90
 
 
@@ -233,17 +246,19 @@ def render_with_playwright(url: str) -> str | None:
                 except Exception as exc:  # noqa: BLE001
                     print(f"  [diag] falhou: {exc}", file=sys.stderr)
 
-            # Tentar abrir os detalhes de financiamento/pagamentos, se houver.
-            for label in ("Financiamento", "Financiar", "pagament", "Como são calculados"):
-                try:
-                    el = page.get_by_text(re.compile(label, re.IGNORECASE))
-                    if el.count():
-                        el.first.click(timeout=2500)
-                        page.wait_for_timeout(1500)
-                        html = page.content() or html
-                        break
-                except Exception:  # noqa: BLE001
-                    pass
+            # Selecionar a versão específica a seguir (cartão no painel direito),
+            # para o detalhe de financiamento (TAN/TAEG da versão) ficar visível.
+            try:
+                card = page.get_by_text(re.compile(VERSION_LABEL, re.IGNORECASE))
+                if card.count():
+                    card.first.click(timeout=3000)
+                    page.wait_for_timeout(2500)
+                    html = page.content() or html
+                    print(f"  (versão selecionada: {VERSION_NAME})")
+                else:
+                    print(f"  [aviso] cartão da versão '{VERSION_NAME}' não encontrado")
+            except Exception as exc:  # noqa: BLE001
+                print(f"  [aviso] não consegui selecionar a versão: {exc}", file=sys.stderr)
 
             return html
         except PWTimeout:
@@ -346,6 +361,19 @@ def analyse(url: str, html: str) -> dict:
     taeg_values = _collect(RE_TAEG_PATTERNS)
     tan_values = _collect(RE_TAN_PATTERNS)
 
+    # Detalhe do financiamento da versão selecionada (ex.: "*9700 € de entrada
+    # inicial, 84 meses, 4,63% T.A.N., 5,66% TAEG, Preço de compra: 45 975 €").
+    version_detail = None
+    version_taeg = None
+    m = RE_DETAIL.search(text)
+    if m:
+        version_detail = collapse_whitespace(m.group(0)).strip()
+        for pat in RE_TAEG_PATTERNS:
+            mm = pat.search(version_detail)
+            if mm:
+                version_taeg = mm.group(1).replace(",", ".")
+                break
+
     promo_hits = []
     for m in RE_PROMO.finditer(text):
         promo_hits.append(snippet_around(text, m.start()))
@@ -362,7 +390,8 @@ def analyse(url: str, html: str) -> dict:
 
     print(
         f"  → financiamento={mentions_financing} TAEG={taeg_values or '—'} "
-        f"TAN={tan_values or '—'} promo={has_promo} (html: {len(html)} chars)"
+        f"TAN={tan_values or '—'} versão({VERSION_NAME})={version_taeg or '—'} "
+        f"promo={has_promo} (html: {len(html)} chars)"
     )
 
     return {
@@ -370,6 +399,8 @@ def analyse(url: str, html: str) -> dict:
         "mentions_financing": mentions_financing,
         "taeg_values": taeg_values,
         "tan_values": tan_values,
+        "version_detail": version_detail,
+        "version_taeg": version_taeg,
         "promo_snippets": promo_hits[:8],
         "has_promo": has_promo,
     }
@@ -389,12 +420,17 @@ def run_checks() -> dict:
     any_promo = any(p.get("has_promo") for p in pages)
     all_taeg = sorted({v for p in pages for v in p.get("taeg_values", [])}, key=lambda v: float(v))
     all_tan = sorted({v for p in pages for v in p.get("tan_values", [])}, key=lambda v: float(v))
+    version_taeg = next((p["version_taeg"] for p in pages if p.get("version_taeg")), None)
+    version_detail = next((p["version_detail"] for p in pages if p.get("version_detail")), None)
 
     return {
         "checked_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "promotion_detected": any_promo,
         "taeg_values": all_taeg,
         "tan_values": all_tan,
+        "version_name": VERSION_NAME,
+        "version_taeg": version_taeg,
+        "version_detail": version_detail,
         "pages": pages,
     }
 
@@ -405,6 +441,8 @@ def signature(report: dict) -> str:
         "promotion_detected": report["promotion_detected"],
         "taeg_values": report["taeg_values"],
         "tan_values": report["tan_values"],
+        "version_taeg": report.get("version_taeg"),
+        "version_detail": report.get("version_detail"),
         "promo": sorted(
             {s for p in report["pages"] for s in p.get("promo_snippets", [])}
         ),
@@ -448,6 +486,13 @@ def build_email_body(report: dict) -> str:
         lines.append(f"Valores de TAEG encontrados: {', '.join(v + '%' for v in report['taeg_values'])}")
     if report["tan_values"]:
         lines.append(f"Valores de TAN encontrados: {', '.join(v + '%' for v in report['tan_values'])}")
+    if report.get("version_taeg") or report.get("version_detail"):
+        lines.append("")
+        lines.append(f"🎯 Versão seguida: {report.get('version_name', '')}")
+        if report.get("version_taeg"):
+            lines.append(f"   TAEG desta versão: {report['version_taeg']}%")
+        if report.get("version_detail"):
+            lines.append(f"   Condições: {report['version_detail']}")
     lines.append("")
 
     for page in report["pages"]:
