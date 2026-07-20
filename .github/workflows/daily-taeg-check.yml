@@ -33,6 +33,9 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Install Chromium (Playwright)
+        run: python -m playwright install --with-deps chromium
+
       - name: Run TAEG checker
         env:
           GMAIL_USER: ${{ secrets.GMAIL_USER }}

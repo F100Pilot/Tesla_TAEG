@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Verificador diário de promoções de TAEG / financiamento do Tesla Model 3 em Portugal.
 
-Faz scraping das páginas públicas da Tesla Portugal, procura menções a
-financiamento a crédito (TAEG, TAN, 0%, campanha, sem juros, etc.), e envia
-um email quando é detetada uma promoção nova ou quando os detalhes mudam
-face à última verificação.
+Abre as páginas públicas da Tesla Portugal num browser real (Chromium via
+Playwright — necessário porque a Tesla bloqueia pedidos HTTP simples com um
+403), procura menções a financiamento a crédito (TAEG, TAN, 0%, campanha, sem
+juros, etc.) e envia um email quando é detetada uma promoção nova ou quando os
+detalhes mudam face à última verificação.
 
 Uso:
     python check_tesla_taeg.py            # verificação normal (email só se mudar)
@@ -31,33 +32,25 @@ from datetime import datetime, timezone
 from email.mime.text import MIMEText
 from pathlib import Path
 
-import requests
-
 # --------------------------------------------------------------------------- #
 # Configuração
 # --------------------------------------------------------------------------- #
 
 # Páginas da Tesla Portugal onde costumam aparecer condições de financiamento.
 URLS = [
-    "https://www.tesla.com/pt_PT/model3",
     "https://www.tesla.com/pt_PT/model3/design",
-    "https://www.tesla.com/pt_PT/inventory/new/m3",
+    "https://www.tesla.com/pt_PT/model3",
 ]
 
 STATE_FILE = Path(__file__).with_name("state.json")
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "pt-PT,pt;q=0.9,en;q=0.8",
-}
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
 
 # Palavras/expressões que indiciam uma PROMOÇÃO de financiamento (não apenas a
-# divulgação legal normal). Se alguma destas aparecer perto de "financiamento"
-# ou "TAEG", consideramos que há campanha.
+# divulgação legal normal). Se alguma destas aparecer, consideramos que há campanha.
 PROMO_KEYWORDS = [
     r"tan\s*(?:de\s*)?0\s*%",
     r"0\s*%\s*(?:de\s*)?(?:tan|juros)",
@@ -71,68 +64,122 @@ PROMO_KEYWORDS = [
 
 # Padrões para extrair valores concretos.
 RE_TAEG = re.compile(r"TAEG[^0-9%]{0,30}?([0-9]+(?:[.,][0-9]+)?)\s*%", re.IGNORECASE)
-RE_TAN = re.compile(r"TAN[^0-9%]{0,30}?([0-9]+(?:[.,][0-9]+)?)\s*%", re.IGNORECASE)
+RE_TAN = re.compile(r"\bTAN\b[^0-9%]{0,30}?([0-9]+(?:[.,][0-9]+)?)\s*%", re.IGNORECASE)
 RE_PROMO = re.compile("|".join(PROMO_KEYWORDS), re.IGNORECASE)
 
-TIMEOUT = 30
+NAV_TIMEOUT = 60_000  # ms
 
 
 # --------------------------------------------------------------------------- #
-# Scraping / deteção
+# Scraping / render com Playwright
 # --------------------------------------------------------------------------- #
 
-def fetch(url: str) -> str | None:
-    """Descarrega o HTML de uma página. Devolve None em caso de falha."""
-    try:
-        resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
-        if resp.status_code == 200:
-            return resp.text
-        print(f"  [aviso] {url} devolveu HTTP {resp.status_code}", file=sys.stderr)
-    except requests.RequestException as exc:  # noqa: BLE001
-        print(f"  [erro] Falha ao descarregar {url}: {exc}", file=sys.stderr)
-    return None
+def render(url: str) -> tuple[str, str] | None:
+    """Abre `url` num Chromium headless e devolve (texto_visivel, html).
+
+    Devolve None se a página não puder ser carregada.
+    """
+    from playwright.sync_api import TimeoutError as PWTimeout
+    from playwright.sync_api import sync_playwright
+
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-blink-features=AutomationControlled"],
+        )
+        context = browser.new_context(
+            user_agent=USER_AGENT,
+            locale="pt-PT",
+            timezone_id="Europe/Lisbon",
+            viewport={"width": 1366, "height": 900},
+        )
+        page = context.new_page()
+        try:
+            resp = page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
+            status = resp.status if resp else "?"
+            print(f"  HTTP {status} — {url}")
+
+            # Aceitar banner de cookies, se existir (não é crítico).
+            for label in ("Aceitar todos", "Aceitar", "Accept all", "Accept"):
+                try:
+                    btn = page.get_by_role("button", name=re.compile(label, re.IGNORECASE))
+                    if btn.count():
+                        btn.first.click(timeout=3000)
+                        break
+                except Exception:  # noqa: BLE001
+                    pass
+
+            # Dar tempo ao JavaScript para carregar preços/financiamento.
+            try:
+                page.wait_for_load_state("networkidle", timeout=15_000)
+            except PWTimeout:
+                pass
+
+            # Tentar abrir detalhes de financiamento/pagamentos, se houver link.
+            for label in ("Financiamento", "financ", "pagament", "Como são calculados"):
+                try:
+                    el = page.get_by_text(re.compile(label, re.IGNORECASE))
+                    if el.count():
+                        el.first.click(timeout=2500)
+                        page.wait_for_timeout(1500)
+                        break
+                except Exception:  # noqa: BLE001
+                    pass
+
+            html = page.content()
+            text = page.evaluate("() => document.body ? document.body.innerText : ''")
+            return text or "", html or ""
+        except PWTimeout:
+            print(f"  [erro] Timeout ao carregar {url}", file=sys.stderr)
+            return None
+        except Exception as exc:  # noqa: BLE001
+            print(f"  [erro] Falha ao carregar {url}: {exc}", file=sys.stderr)
+            return None
+        finally:
+            context.close()
+            browser.close()
 
 
 def collapse_whitespace(text: str) -> str:
     return re.sub(r"\s+", " ", text)
 
 
-def visible_text(html: str) -> str:
-    """Remove blocos <script>/<style> e todas as tags, devolvendo texto legível."""
-    no_scripts = re.sub(r"<(script|style)\b[^>]*>.*?</\1>", " ", html, flags=re.IGNORECASE | re.DOTALL)
-    no_tags = re.sub(r"<[^>]+>", " ", no_scripts)
-    return collapse_whitespace(no_tags).strip()
-
-
-def snippet_around(text: str, index: int, radius: int = 90) -> str:
+def snippet_around(text: str, index: int, radius: int = 110) -> str:
     start = max(0, index - radius)
     end = min(len(text), index + radius)
     return collapse_whitespace(text[start:end]).strip()
 
 
-def analyse(url: str, html: str) -> dict:
-    """Analisa o HTML de uma página à procura de sinais de promoção de TAEG."""
-    # Procura de valores no HTML completo (apanha também JSON embebido em scripts).
-    full = collapse_whitespace(html)
-    # Excertos legíveis a partir do texto visível (sem tags nem scripts).
-    text = visible_text(html)
+def analyse(url: str, text: str, html: str) -> dict:
+    """Analisa o conteúdo renderizado de uma página à procura de sinais de TAEG."""
+    visible = collapse_whitespace(text)
+    full = collapse_whitespace(html)  # apanha também JSON/atributos embebidos
 
-    taeg_values = sorted({m.group(1).replace(",", ".") for m in RE_TAEG.finditer(full)})
-    tan_values = sorted({m.group(1).replace(",", ".") for m in RE_TAN.finditer(full)})
+    # Valores: procurar primeiro no texto visível, depois no HTML completo.
+    taeg_values = sorted(
+        {m.group(1).replace(",", ".") for m in RE_TAEG.finditer(visible)}
+        or {m.group(1).replace(",", ".") for m in RE_TAEG.finditer(full)}
+    )
+    tan_values = sorted(
+        {m.group(1).replace(",", ".") for m in RE_TAN.finditer(visible)}
+        or {m.group(1).replace(",", ".") for m in RE_TAN.finditer(full)}
+    )
 
     promo_hits = []
-    for m in RE_PROMO.finditer(text):
-        promo_hits.append(snippet_around(text, m.start()))
-    # Remover duplicados mantendo ordem.
+    for m in RE_PROMO.finditer(visible):
+        promo_hits.append(snippet_around(visible, m.start()))
     seen = set()
     promo_hits = [s for s in promo_hits if not (s in seen or seen.add(s))]
 
     mentions_financing = bool(
-        re.search(r"financiamento|crédito|credito|TAEG|TAN", text, re.IGNORECASE)
+        re.search(r"financiamento|crédito|credito|TAEG|\bTAN\b", visible, re.IGNORECASE)
     )
-
-    # Consideramos "promoção" quando há palavras de campanha OU um TAN 0%.
     has_promo = bool(promo_hits) or "0" in tan_values or "0.0" in tan_values
+
+    print(
+        f"  → financiamento={mentions_financing} TAEG={taeg_values or '—'} "
+        f"TAN={tan_values or '—'} promo={has_promo} (texto: {len(visible)} chars)"
+    )
 
     return {
         "url": url,
@@ -149,11 +196,12 @@ def run_checks() -> dict:
     pages = []
     for url in URLS:
         print(f"A verificar: {url}")
-        html = fetch(url)
-        if html is None:
+        rendered = render(url)
+        if rendered is None:
             pages.append({"url": url, "error": "não acessível", "has_promo": False})
             continue
-        pages.append(analyse(url, html))
+        text, html = rendered
+        pages.append(analyse(url, text, html))
 
     any_promo = any(p.get("has_promo") for p in pages)
     all_taeg = sorted({v for p in pages for v in p.get("taeg_values", [])})
@@ -224,6 +272,10 @@ def build_email_body(report: dict) -> str:
         if page.get("error"):
             lines.append(f"    (não foi possível aceder: {page['error']})")
             continue
+        if page.get("taeg_values"):
+            lines.append(f"    TAEG: {', '.join(v + '%' for v in page['taeg_values'])}")
+        if page.get("tan_values"):
+            lines.append(f"    TAN: {', '.join(v + '%' for v in page['tan_values'])}")
         if page.get("has_promo"):
             lines.append("    ⭐ Sinais de promoção nesta página.")
         for snip in page.get("promo_snippets", []):
@@ -288,7 +340,6 @@ def main() -> int:
     changed = prev.get("signature") != sig
     first_run = "signature" not in prev
 
-    # Decidir se notificamos.
     should_notify = args.force or (report["promotion_detected"] and changed)
 
     if args.dry_run:
@@ -303,7 +354,6 @@ def main() -> int:
         reason = "sem promoção" if not report["promotion_detected"] else "sem mudanças desde a última verificação"
         print(f"Sem notificação ({reason}).")
 
-    # Guardar estado.
     new_state = {
         "signature": sig,
         "last_checked": report["checked_at"],
@@ -315,20 +365,21 @@ def main() -> int:
             {
                 "checked_at": report["checked_at"],
                 "promotion_detected": report["promotion_detected"],
+                "taeg_values": report["taeg_values"],
+                "tan_values": report["tan_values"],
                 "changed": changed and not first_run,
             }
         ])[-30:],
     }
     save_state(new_state)
 
-    # Escrever resumo para o GitHub Actions, se aplicável.
     summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary_path:
         with open(summary_path, "a", encoding="utf-8") as fh:
             fh.write("## Verificador TAEG — Tesla Model 3 (PT)\n\n")
             fh.write(f"- **Promoção detetada:** {'✅ Sim' if report['promotion_detected'] else '❌ Não'}\n")
-            fh.write(f"- **TAEG:** {', '.join(report['taeg_values']) or '—'}\n")
-            fh.write(f"- **TAN:** {', '.join(report['tan_values']) or '—'}\n")
+            fh.write(f"- **TAEG:** {', '.join(v + '%' for v in report['taeg_values']) or '—'}\n")
+            fh.write(f"- **TAN:** {', '.join(v + '%' for v in report['tan_values']) or '—'}\n")
             fh.write(f"- **Notificação enviada:** {'Sim' if should_notify and not args.dry_run else 'Não'}\n")
 
     return 0
