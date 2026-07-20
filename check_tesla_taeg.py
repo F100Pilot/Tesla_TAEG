@@ -197,18 +197,29 @@ def render_with_playwright(url: str) -> str | None:
 
             html = page.content() or ""
 
-            # Se a Akamai devolveu página de bloqueio (ou o conteúdo ainda é o
-            # esqueleto), esperar e recarregar 1x.
-            if _looks_blocked(html) or "taeg" not in html.lower():
-                print(f"  (conteúdo incompleto: {len(html)} chars — a aguardar e recarregar)")
-                page.wait_for_timeout(5000)
-                try:
-                    page.reload(wait_until="domcontentloaded", timeout=nav_timeout)
-                    page.wait_for_load_state("networkidle", timeout=12000)
-                    page.wait_for_timeout(3500)
-                except Exception:  # noqa: BLE001
-                    pass
+            # Só recarrega se for mesmo página de bloqueio (recarregar à bruta
+            # pode disparar a proteção). Dá mais tempo à app antes de desistir.
+            if _looks_blocked(html):
+                print(f"  (bloqueado/incompleto: {len(html)} chars — a aguardar mais)")
+                page.wait_for_timeout(8000)
                 html = page.content() or ""
+
+            # DIAGNÓSTICO: guardar a página e mostrar um excerto quando não há TAEG.
+            if "taeg" not in html.lower():
+                try:
+                    safe = re.sub(r"[^a-z0-9]+", "_", url.lower())[-40:]
+                    dbg = Path(__file__).with_name(f"debug_{safe}.html")
+                    dbg.write_text(html, encoding="utf-8")
+                    title = ""
+                    try:
+                        title = page.title()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    snippet = collapse_whitespace(visible_text(html))[:280]
+                    print(f"  [diag] título='{title}' | {len(html)} chars | guardado em {dbg.name}")
+                    print(f"  [diag] texto: {snippet}")
+                except Exception as exc:  # noqa: BLE001
+                    print(f"  [diag] falhou: {exc}", file=sys.stderr)
 
             # Tentar abrir os detalhes de financiamento/pagamentos, se houver.
             for label in ("Financiamento", "Financiar", "pagament", "Como são calculados"):
