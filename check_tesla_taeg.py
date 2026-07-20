@@ -44,10 +44,11 @@ import requests
 # Configuração
 # --------------------------------------------------------------------------- #
 
-# Páginas da Tesla Portugal onde costumam aparecer condições de financiamento.
+# Página de configuração do Model 3 — tem o banner promocional (ex.: "1,77% TAEG")
+# e o TAEG detalhado da versão selecionada. Usamos só uma para não aquecer o IP
+# (a Akamia bloqueia IPs com muitos pedidos). Configurável via TESLA_URL.
 URLS = [
-    "https://www.tesla.com/pt_PT/model3/design",
-    "https://www.tesla.com/pt_PT/model3",
+    os.environ.get("TESLA_URL", "https://www.tesla.com/pt_PT/model3/design"),
 ]
 
 STATE_FILE = Path(__file__).with_name("state.json")
@@ -143,29 +144,40 @@ def render_with_playwright(url: str) -> str | None:
     )
     print(f"  (browser: {driver}, headless={headless})")
 
+    # Canais a tentar: Google Chrome real (mais furtivo contra a Akamai) e,
+    # em alternativa, o Chromium empacotado. Configurável via CHROME_CHANNEL.
+    env_channel = os.environ.get("CHROME_CHANNEL")
+    channels = [env_channel] if env_channel else ["chrome", None]
+
     with sync_playwright() as pw:
-        launch_kwargs = dict(
-            user_data_dir=profile_dir,
-            headless=headless,
-            locale="pt-PT",
-            timezone_id="Europe/Lisbon",
-            viewport={"width": 1366, "height": 900},
-            args=["--no-sandbox", "--disable-dev-shm-usage"],
-        )
-        channel = os.environ.get("CHROME_CHANNEL")
-        if channel:
-            launch_kwargs["channel"] = channel
-        try:
-            context = pw.chromium.launch_persistent_context(**launch_kwargs)
-        except Exception as exc:  # noqa: BLE001
-            print(f"  [erro] Não foi possível iniciar o Chromium: {exc}", file=sys.stderr)
+        context = None
+        used = None
+        for ch in channels:
+            launch_kwargs = dict(
+                user_data_dir=profile_dir,
+                headless=headless,
+                locale="pt-PT",
+                timezone_id="Europe/Lisbon",
+                viewport={"width": 1366, "height": 900},
+                args=["--no-sandbox", "--disable-dev-shm-usage"],
+            )
+            if ch:
+                launch_kwargs["channel"] = ch
+            try:
+                context = pw.chromium.launch_persistent_context(**launch_kwargs)
+                used = ch or "chromium"
+                break
+            except Exception as exc:  # noqa: BLE001
+                print(f"  [aviso] canal '{ch or 'chromium'}' indisponível: {exc}", file=sys.stderr)
+        if context is None:
+            print("  [erro] Não foi possível iniciar nenhum browser.", file=sys.stderr)
             return None
 
         page = context.pages[0] if context.pages else context.new_page()
         try:
             resp = page.goto(url, wait_until="domcontentloaded", timeout=nav_timeout)
             status = resp.status if resp else "?"
-            print(f"  HTTP {status} — {url} ({driver})")
+            print(f"  HTTP {status} — {url} ({driver}/{used})")
 
             for label in ("Aceitar todos", "Aceitar", "Aceitar tudo", "Accept all",
                           "Accept", "Concordo", "Permitir todos"):

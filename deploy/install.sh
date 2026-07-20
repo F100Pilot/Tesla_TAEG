@@ -42,6 +42,11 @@ python3 -m venv "${APP_DIR}/.venv"
 echo ">> A instalar o Chromium stealth (patchright) + dependências do sistema..."
 "${APP_DIR}/.venv/bin/python" -m patchright install --with-deps chromium
 
+echo ">> A instalar o Google Chrome real (mais furtivo contra a Akamai)..."
+# O Chrome real reduz muito a deteção anti-bot. Se falhar, o script usa o Chromium.
+"${APP_DIR}/.venv/bin/python" -m patchright install --with-deps chrome || \
+  echo ">> [aviso] Não foi possível instalar o Google Chrome; será usado o Chromium."
+
 echo ">> A instalar o serviço e o timer do systemd..."
 install -m 644 "${APP_DIR}/deploy/tesla-taeg.service" /etc/systemd/system/tesla-taeg.service
 install -m 644 "${APP_DIR}/deploy/tesla-taeg.timer" /etc/systemd/system/tesla-taeg.timer
