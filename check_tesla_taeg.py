@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 """Verificador diário de promoções de TAEG / financiamento do Tesla Model 3 em Portugal.
 
-Faz scraping das páginas públicas da Tesla Portugal, procura menções a
-financiamento a crédito (TAEG, TAN, 0%, campanha, sem juros, etc.), e envia
-um email quando é detetada uma promoção nova ou quando os detalhes mudam
-face à última verificação.
+A Tesla bloqueia (HTTP 403) os pedidos vindos de IPs de datacenter, como os do
+GitHub Actions. Para contornar isso, este script encaminha os pedidos por uma
+API de scraping com IPs residenciais e renderização de JavaScript (por omissão,
+ScraperAPI) quando a variável de ambiente SCRAPERAPI_KEY está definida. Sem essa
+chave, faz um pedido direto (útil quando corre a partir de um IP residencial).
+
+Procura menções a financiamento a crédito (TAEG, TAN, 0%, campanha, sem juros,
+etc.) e envia um email quando é detetada uma promoção nova ou quando os detalhes
+mudam face à última verificação.
 
 Uso:
     python check_tesla_taeg.py            # verificação normal (email só se mudar)
@@ -12,6 +17,7 @@ Uso:
     python check_tesla_taeg.py --dry-run  # não envia email, apenas imprime o resultado
 
 Configuração por variáveis de ambiente (ver README.md):
+    SCRAPERAPI_KEY      -> chave da API de scraping (recomendado no GitHub Actions)
     GMAIL_USER          -> conta Gmail que envia (ex: pflm.bet@gmail.com)
     GMAIL_APP_PASSWORD  -> App Password de 16 caracteres do Gmail
     NOTIFY_EMAIL        -> destinatário (por omissão = GMAIL_USER)
@@ -38,26 +44,26 @@ import requests
 # --------------------------------------------------------------------------- #
 
 # Páginas da Tesla Portugal onde costumam aparecer condições de financiamento.
+# Cada pedido à API de scraping consome créditos, por isso mantemos a lista curta.
 URLS = [
-    "https://www.tesla.com/pt_PT/model3",
     "https://www.tesla.com/pt_PT/model3/design",
-    "https://www.tesla.com/pt_PT/inventory/new/m3",
+    "https://www.tesla.com/pt_PT/model3",
 ]
 
 STATE_FILE = Path(__file__).with_name("state.json")
 
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+
 HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-    ),
+    "User-Agent": USER_AGENT,
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "pt-PT,pt;q=0.9,en;q=0.8",
 }
 
-# Palavras/expressões que indiciam uma PROMOÇÃO de financiamento (não apenas a
-# divulgação legal normal). Se alguma destas aparecer perto de "financiamento"
-# ou "TAEG", consideramos que há campanha.
+# Palavras/expressões que indiciam uma PROMOÇÃO de financiamento.
 PROMO_KEYWORDS = [
     r"tan\s*(?:de\s*)?0\s*%",
     r"0\s*%\s*(?:de\s*)?(?:tan|juros)",
@@ -69,25 +75,46 @@ PROMO_KEYWORDS = [
     r"taxa\s*reduzida",
 ]
 
-# Padrões para extrair valores concretos.
 RE_TAEG = re.compile(r"TAEG[^0-9%]{0,30}?([0-9]+(?:[.,][0-9]+)?)\s*%", re.IGNORECASE)
-RE_TAN = re.compile(r"TAN[^0-9%]{0,30}?([0-9]+(?:[.,][0-9]+)?)\s*%", re.IGNORECASE)
+RE_TAN = re.compile(r"\bTAN\b[^0-9%]{0,30}?([0-9]+(?:[.,][0-9]+)?)\s*%", re.IGNORECASE)
 RE_PROMO = re.compile("|".join(PROMO_KEYWORDS), re.IGNORECASE)
 
-TIMEOUT = 30
+TIMEOUT = 90
 
 
 # --------------------------------------------------------------------------- #
-# Scraping / deteção
+# Scraping
 # --------------------------------------------------------------------------- #
 
 def fetch(url: str) -> str | None:
-    """Descarrega o HTML de uma página. Devolve None em caso de falha."""
+    """Descarrega o HTML de `url`, via API de scraping se houver SCRAPERAPI_KEY.
+
+    Devolve None em caso de falha.
+    """
+    api_key = os.environ.get("SCRAPERAPI_KEY")
+
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
+        if api_key:
+            # Rota via ScraperAPI: IP residencial + renderização de JavaScript.
+            params = {
+                "api_key": api_key,
+                "url": url,
+                "render": "true",
+                "country_code": os.environ.get("SCRAPER_COUNTRY", "pt"),
+            }
+            # ultra_premium contorna anti-bots fortes (Akamai). Desligável para poupar créditos.
+            if os.environ.get("SCRAPER_ULTRA", "true").lower() == "true":
+                params["ultra_premium"] = "true"
+            resp = requests.get(
+                "https://api.scraperapi.com/", params=params, timeout=TIMEOUT
+            )
+        else:
+            resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
+
         if resp.status_code == 200:
             return resp.text
-        print(f"  [aviso] {url} devolveu HTTP {resp.status_code}", file=sys.stderr)
+        via = "ScraperAPI" if api_key else "direto"
+        print(f"  [aviso] {url} devolveu HTTP {resp.status_code} ({via})", file=sys.stderr)
     except requests.RequestException as exc:  # noqa: BLE001
         print(f"  [erro] Falha ao descarregar {url}: {exc}", file=sys.stderr)
     return None
@@ -99,12 +126,14 @@ def collapse_whitespace(text: str) -> str:
 
 def visible_text(html: str) -> str:
     """Remove blocos <script>/<style> e todas as tags, devolvendo texto legível."""
-    no_scripts = re.sub(r"<(script|style)\b[^>]*>.*?</\1>", " ", html, flags=re.IGNORECASE | re.DOTALL)
+    no_scripts = re.sub(
+        r"<(script|style)\b[^>]*>.*?</\1>", " ", html, flags=re.IGNORECASE | re.DOTALL
+    )
     no_tags = re.sub(r"<[^>]+>", " ", no_scripts)
     return collapse_whitespace(no_tags).strip()
 
 
-def snippet_around(text: str, index: int, radius: int = 90) -> str:
+def snippet_around(text: str, index: int, radius: int = 110) -> str:
     start = max(0, index - radius)
     end = min(len(text), index + radius)
     return collapse_whitespace(text[start:end]).strip()
@@ -112,27 +141,28 @@ def snippet_around(text: str, index: int, radius: int = 90) -> str:
 
 def analyse(url: str, html: str) -> dict:
     """Analisa o HTML de uma página à procura de sinais de promoção de TAEG."""
-    # Procura de valores no HTML completo (apanha também JSON embebido em scripts).
-    full = collapse_whitespace(html)
-    # Excertos legíveis a partir do texto visível (sem tags nem scripts).
-    text = visible_text(html)
+    full = collapse_whitespace(html)      # apanha também JSON embebido em scripts
+    text = visible_text(html)             # texto legível, para excertos
 
+    # Valores: procurar no HTML completo (cobre texto visível + JSON de config).
     taeg_values = sorted({m.group(1).replace(",", ".") for m in RE_TAEG.finditer(full)})
     tan_values = sorted({m.group(1).replace(",", ".") for m in RE_TAN.finditer(full)})
 
     promo_hits = []
     for m in RE_PROMO.finditer(text):
         promo_hits.append(snippet_around(text, m.start()))
-    # Remover duplicados mantendo ordem.
     seen = set()
     promo_hits = [s for s in promo_hits if not (s in seen or seen.add(s))]
 
     mentions_financing = bool(
-        re.search(r"financiamento|crédito|credito|TAEG|TAN", text, re.IGNORECASE)
+        re.search(r"financiamento|crédito|credito|TAEG|\bTAN\b", full, re.IGNORECASE)
     )
-
-    # Consideramos "promoção" quando há palavras de campanha OU um TAN 0%.
     has_promo = bool(promo_hits) or "0" in tan_values or "0.0" in tan_values
+
+    print(
+        f"  → financiamento={mentions_financing} TAEG={taeg_values or '—'} "
+        f"TAN={tan_values or '—'} promo={has_promo} (html: {len(html)} chars)"
+    )
 
     return {
         "url": url,
@@ -224,11 +254,15 @@ def build_email_body(report: dict) -> str:
         if page.get("error"):
             lines.append(f"    (não foi possível aceder: {page['error']})")
             continue
+        if page.get("taeg_values"):
+            lines.append(f"    TAEG: {', '.join(v + '%' for v in page['taeg_values'])}")
+        if page.get("tan_values"):
+            lines.append(f"    TAN: {', '.join(v + '%' for v in page['tan_values'])}")
         if page.get("has_promo"):
             lines.append("    ⭐ Sinais de promoção nesta página.")
         for snip in page.get("promo_snippets", []):
             lines.append(f"    • ...{snip}...")
-        if not page.get("promo_snippets") and not page.get("has_promo"):
+        if not page.get("promo_snippets") and not page.get("has_promo") and not page.get("taeg_values"):
             lines.append("    (sem sinais de campanha)")
     lines.append("")
     lines.append("Confirma sempre as condições diretamente no site oficial da Tesla:")
@@ -277,6 +311,13 @@ def main() -> int:
     parser.add_argument("--dry-run", action="store_true", help="Não enviar email; só imprimir.")
     args = parser.parse_args()
 
+    if not os.environ.get("SCRAPERAPI_KEY"):
+        print(
+            "[aviso] SCRAPERAPI_KEY não definida — pedido direto (a Tesla bloqueia "
+            "IPs de datacenter, por isso no GitHub Actions isto costuma dar 403).",
+            file=sys.stderr,
+        )
+
     report = run_checks()
     sig = signature(report)
 
@@ -288,7 +329,6 @@ def main() -> int:
     changed = prev.get("signature") != sig
     first_run = "signature" not in prev
 
-    # Decidir se notificamos.
     should_notify = args.force or (report["promotion_detected"] and changed)
 
     if args.dry_run:
@@ -303,7 +343,6 @@ def main() -> int:
         reason = "sem promoção" if not report["promotion_detected"] else "sem mudanças desde a última verificação"
         print(f"Sem notificação ({reason}).")
 
-    # Guardar estado.
     new_state = {
         "signature": sig,
         "last_checked": report["checked_at"],
@@ -315,20 +354,21 @@ def main() -> int:
             {
                 "checked_at": report["checked_at"],
                 "promotion_detected": report["promotion_detected"],
+                "taeg_values": report["taeg_values"],
+                "tan_values": report["tan_values"],
                 "changed": changed and not first_run,
             }
         ])[-30:],
     }
     save_state(new_state)
 
-    # Escrever resumo para o GitHub Actions, se aplicável.
     summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary_path:
         with open(summary_path, "a", encoding="utf-8") as fh:
             fh.write("## Verificador TAEG — Tesla Model 3 (PT)\n\n")
             fh.write(f"- **Promoção detetada:** {'✅ Sim' if report['promotion_detected'] else '❌ Não'}\n")
-            fh.write(f"- **TAEG:** {', '.join(report['taeg_values']) or '—'}\n")
-            fh.write(f"- **TAN:** {', '.join(report['tan_values']) or '—'}\n")
+            fh.write(f"- **TAEG:** {', '.join(v + '%' for v in report['taeg_values']) or '—'}\n")
+            fh.write(f"- **TAN:** {', '.join(v + '%' for v in report['tan_values']) or '—'}\n")
             fh.write(f"- **Notificação enviada:** {'Sim' if should_notify and not args.dry_run else 'Não'}\n")
 
     return 0

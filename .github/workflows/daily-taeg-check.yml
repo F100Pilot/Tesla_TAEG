@@ -35,6 +35,7 @@ jobs:
 
       - name: Run TAEG checker
         env:
+          SCRAPERAPI_KEY: ${{ secrets.SCRAPERAPI_KEY }}
           GMAIL_USER: ${{ secrets.GMAIL_USER }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           NOTIFY_EMAIL: ${{ secrets.NOTIFY_EMAIL }}

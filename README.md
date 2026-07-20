@@ -10,10 +10,16 @@ computador ligado).
 
 ---
 
+> ℹ️ **Importante:** a Tesla bloqueia (HTTP 403) os pedidos vindos de servidores/datacenters,
+> como os do GitHub Actions. Por isso o verificador usa uma **API de scraping**
+> (ScraperAPI, com plano gratuito) que faz o pedido a partir de um IP residencial
+> e executa o JavaScript da página. Sem essa chave, o verificador só funciona se
+> for corrido a partir de um IP residencial (o teu computador).
+
 ## Como funciona
 
 1. Uma vez por dia, o GitHub Actions corre o script [`check_tesla_taeg.py`](check_tesla_taeg.py).
-2. O script descarrega as páginas públicas do Model 3 na Tesla Portugal e procura:
+2. O script descarrega as páginas públicas do Model 3 na Tesla Portugal (via ScraperAPI) e procura:
    - valores de **TAEG** e **TAN**;
    - palavras de campanha: *"TAN 0%"*, *"sem juros"*, *"campanha"*, *"promoção"*,
      *"condições especiais"*, *"taxa reduzida"*, etc.
@@ -39,17 +45,29 @@ guardar 2 secrets no repositório.
 3. Cria uma password de app (ex.: nome "Tesla TAEG"). Vais receber um código de
    **16 letras** (ex.: `abcd efgh ijkl mnop`). Copia-o **sem espaços**.
 
-### 2. Adicionar os secrets no GitHub
+### 2. Criar uma chave da API de scraping (ScraperAPI — grátis)
+
+1. Vai a <https://www.scraperapi.com/> e cria uma conta gratuita.
+2. No painel (dashboard) copia a tua **API Key**.
+3. O plano gratuito dá 1.000 créditos/mês — mais do que suficiente para uma
+   verificação por dia.
+
+> Alternativas equivalentes: [ZenRows](https://www.zenrows.com/),
+> [ScrapingBee](https://www.scrapingbee.com/). Se preferires outra, adapta a
+> função `fetch()` em [`check_tesla_taeg.py`](check_tesla_taeg.py).
+
+### 3. Adicionar os secrets no GitHub
 
 No repositório: **Settings → Secrets and variables → Actions → New repository secret**
 
 | Nome do secret       | Valor                                             |
 |----------------------|---------------------------------------------------|
+| `SCRAPERAPI_KEY`     | A API Key do ScraperAPI                           |
 | `GMAIL_USER`         | O teu Gmail (ex.: `pflm.bet@gmail.com`)           |
 | `GMAIL_APP_PASSWORD` | A App Password de 16 letras (sem espaços)         |
 | `NOTIFY_EMAIL`       | *(opcional)* destinatário; por omissão = `GMAIL_USER` |
 
-### 3. Ativar os GitHub Actions
+### 4. Ativar os GitHub Actions
 
 Vai ao separador **Actions** do repositório e, se pedido, confirma que queres
 ativar os workflows. Está agendado para correr **todos os dias às 08:00 UTC**.
@@ -67,6 +85,7 @@ ativar os workflows. Está agendado para correr **todos os dias às 08:00 UTC**.
   pip install -r requirements.txt
 
   # Configura as variáveis de ambiente
+  export SCRAPERAPI_KEY="a_tua_api_key"          # opcional se correres de casa
   export GMAIL_USER="pflm.bet@gmail.com"
   export GMAIL_APP_PASSWORD="abcdefghijklmnop"   # App Password sem espaços
 
