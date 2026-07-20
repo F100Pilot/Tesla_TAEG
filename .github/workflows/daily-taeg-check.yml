@@ -1,9 +1,11 @@
 name: Verificação diária TAEG Tesla Model 3
 
 on:
-  schedule:
-    # Todos os dias às 08:00 UTC (~09:00 Portugal continental no inverno, 09:00/10:00 no verão)
-    - cron: "0 8 * * *"
+  # NOTA: a partir da cloud (GitHub) a Tesla bloqueia com HTTP 403 os IPs de
+  # datacenter, exceto com um plano PAGO de proxies residenciais (define o secret
+  # SCRAPERAPI_KEY para o usar). A verificação diária gratuita corre no Proxmox
+  # (IP residencial) — ver deploy/ e README. Por isso não há agendamento aqui;
+  # fica apenas a execução manual, útil se usares proxies pagos.
   workflow_dispatch:
     inputs:
       force:

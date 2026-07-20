@@ -1,0 +1,11 @@
+[Unit]
+Description=Verificador de TAEG do Tesla Model 3 (PT)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/tesla-taeg
+EnvironmentFile=/etc/tesla-taeg.env
+ExecStart=/opt/tesla-taeg/.venv/bin/python /opt/tesla-taeg/check_tesla_taeg.py
+# Sem promoção nova não envia email; é seguro correr todos os dias.

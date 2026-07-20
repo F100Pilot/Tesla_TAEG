@@ -1,0 +1,12 @@
+[Unit]
+Description=Corre o Verificador de TAEG do Tesla Model 3 diariamente
+
+[Timer]
+# Todos os dias às 20:00 (hora local do container — definida para Europe/Lisbon
+# pelo install.sh). Para mudar a hora, edita a linha abaixo e corre:
+#   systemctl daemon-reload
+OnCalendar=*-*-* 20:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
