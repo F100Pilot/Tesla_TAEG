@@ -1,11 +1,11 @@
 {
   "signature": "b765e548312be3e244cff95c83532a9ca84720393dd6845c6658b691d4723390",
-  "last_checked": "2026-07-20T17:10:55+00:00",
+  "last_checked": "2026-07-20T17:12:28+00:00",
   "promotion_detected": false,
   "taeg_values": [],
   "tan_values": [],
   "last_report": {
-    "checked_at": "2026-07-20T17:10:55+00:00",
+    "checked_at": "2026-07-20T17:12:28+00:00",
     "promotion_detected": false,
     "taeg_values": [],
     "tan_values": [],
@@ -30,6 +30,13 @@
     },
     {
       "checked_at": "2026-07-20T17:10:55+00:00",
+      "promotion_detected": false,
+      "taeg_values": [],
+      "tan_values": [],
+      "changed": false
+    },
+    {
+      "checked_at": "2026-07-20T17:12:28+00:00",
       "promotion_detected": false,
       "taeg_values": [],
       "tan_values": [],
