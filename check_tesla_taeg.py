@@ -372,18 +372,46 @@ def analyse(url: str, html: str) -> dict:
     taeg_values = _collect(RE_TAEG_PATTERNS)
     tan_values = _collect(RE_TAN_PATTERNS)
 
-    # Detalhe do financiamento da versão selecionada (ex.: "*9700 € de entrada
-    # inicial, 84 meses, 4,63% T.A.N., 5,66% TAEG, Preço de compra: 45 975 €").
+    # Detalhe do financiamento (ex.: "*9700 € de entrada inicial, 84 meses,
+    # 4,63% T.A.N., 5,66% TAEG, Preço de compra: 45 975 €"). Pode haver mais do
+    # que um bloco (um por versão); escolhemos o da versão configurada.
+    details = [collapse_whitespace(m.group(0)).strip() for m in RE_DETAIL.finditer(text)]
+    if details:
+        print(f"  [diag] {len(details)} bloco(s) de financiamento encontrados:")
+        for d in details:
+            print(f"      · {d}")
+
+    def _taeg_of(detail: str):
+        for pat in RE_TAEG_PATTERNS:
+            mm = pat.search(detail)
+            if mm:
+                return mm.group(1).replace(",", ".")
+        return None
+
     version_detail = None
     version_taeg = None
-    m = RE_DETAIL.search(text)
-    if m:
-        version_detail = collapse_whitespace(m.group(0)).strip()
-        for pat in RE_TAEG_PATTERNS:
-            mm = pat.search(version_detail)
-            if mm:
-                version_taeg = mm.group(1).replace(",", ".")
-                break
+    if details:
+        # Preferir o bloco cujo contexto imediato menciona a versão configurada.
+        try:
+            label_re = re.compile(VERSION_LABEL, re.IGNORECASE)
+        except re.error:
+            label_re = None
+        chosen = None
+        if label_re:
+            for m in RE_DETAIL.finditer(text):
+                ctx = text[max(0, m.start() - 400): m.start()]
+                if label_re.search(ctx):
+                    chosen = collapse_whitespace(m.group(0)).strip()
+                    break
+        version_detail = chosen or details[0]
+        version_taeg = _taeg_of(version_detail)
+
+    # Guardar o texto visível para diagnóstico (permite afinar a seleção da versão).
+    try:
+        dump = Path(__file__).with_name("last_page_text.txt")
+        dump.write_text(text[:200000], encoding="utf-8")
+    except Exception:  # noqa: BLE001
+        pass
 
     promo_hits = []
     for m in RE_PROMO.finditer(text):
