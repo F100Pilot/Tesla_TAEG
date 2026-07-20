@@ -34,6 +34,7 @@ import re
 import smtplib
 import ssl
 import sys
+import time
 from datetime import datetime, timezone
 from email.mime.text import MIMEText
 from pathlib import Path
@@ -246,6 +247,12 @@ def render_with_playwright(url: str) -> str | None:
                 except Exception as exc:  # noqa: BLE001
                     print(f"  [diag] falhou: {exc}", file=sys.stderr)
 
+            # Página de bloqueio da Akamai: devolver "" (bloqueado), para o
+            # chamador distinguir de "browser indisponível" (None) e não
+            # martelar o site com mais pedidos.
+            if _looks_blocked(html):
+                return ""
+
             # Selecionar a versão específica a seguir (cartão no painel direito),
             # para o detalhe de financiamento (TAN/TAEG da versão) ficar visível.
             try:
@@ -286,8 +293,12 @@ def fetch(url: str) -> str | None:
         # A partir de um IP residencial (ex.: Proxmox em casa) a Tesla não bloqueia
         # o IP, mas deteta browsers automatizados — usamos um Chromium stealth.
         html = render_with_playwright(url)
-        if html is not None:
+        if html:
             return html
+        if html == "":
+            # Bloqueado pela Akamai — não insistir com mais pedidos agora.
+            print("  [aviso] bloqueado pela Akamai nesta tentativa", file=sys.stderr)
+            return None
         # Sem browser disponível: tentar pedido direto (pode não ter os valores JS).
         try:
             resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
@@ -558,6 +569,22 @@ def main() -> int:
     args = parser.parse_args()
 
     report = run_checks()
+
+    # Se nada foi acessível (bloqueio da Akamai / rede), tentar de novo mais
+    # tarde — a Akamia costuma libertar após um período de acalmia.
+    retry_min = int(os.environ.get("RETRY_AFTER_MIN", "30"))
+    if all(p.get("error") for p in report["pages"]) and retry_min > 0:
+        print(f"[aviso] Página inacessível — nova tentativa dentro de {retry_min} min...")
+        time.sleep(retry_min * 60)
+        report = run_checks()
+
+    # Continuar sem acesso: manter o estado anterior intacto (para não gerar
+    # emails repetidos quando o acesso voltar) e sair com erro.
+    if all(p.get("error") for p in report["pages"]):
+        print("[erro] Não foi possível aceder à Tesla nesta execução. "
+              "O estado anterior foi mantido; nova tentativa no próximo agendamento.")
+        return 1
+
     sig = signature(report)
 
     print("\n" + "=" * 60)

@@ -7,6 +7,9 @@ Wants=network-online.target
 Type=oneshot
 WorkingDirectory=/opt/tesla-taeg
 EnvironmentFile=/etc/tesla-taeg.env
+# Se a Akamai bloquear, o script espera (RETRY_AFTER_MIN, 30 min por omissão)
+# e tenta de novo — dar folga para isso.
+TimeoutStartSec=90min
 # Corre em ecrã virtual (xvfb) para o Chromium arrancar em modo visível (headful),
 # o que reduz muito a deteção anti-bot. Sem promoção nova não envia email.
 ExecStart=/usr/bin/xvfb-run -a /opt/tesla-taeg/.venv/bin/python /opt/tesla-taeg/check_tesla_taeg.py
